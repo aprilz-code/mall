@@ -1,0 +1,322 @@
+package com.myfun.framework.util;
+
+import com.myfun.repository.admindb.dao.FunSensitiveWordsTypeMapper;
+import com.myfun.repository.admindb.dao.FunSensitiveWordsValueMapper;
+import com.myfun.repository.admindb.po.FunSensitiveWordsType;
+import com.myfun.repository.admindb.po.FunSensitiveWordsValue;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.CharUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import java.util.*;
+
+/**
+ * @description: 敏感词utils
+ * @author: liushaohui
+ * @since: 2022/4/13
+ **/
+@Component
+public class SensitiveWordsUtils {
+
+    private static final Logger log = LoggerFactory.getLogger(SensitiveWordsUtils.class);
+
+    // 将敏感词替换成 ***
+    private static final String REPLACEMENT = "***";
+
+    private static SensitiveWordsUtils sensitiveWordsUtils;
+
+    // 根节点
+    private static HashMap<String, TrieNode> roots = new HashMap<>();
+
+    @Value("${enableSensitiveWords:false}")
+    private boolean enableSensitiveWords;
+
+    @Autowired
+    private FunSensitiveWordsValueMapper funSensitiveWordsValueMapper;
+
+    @Autowired
+    private FunSensitiveWordsTypeMapper funSensitiveWordsTypeMapper;
+
+    /**
+     * 初始化前缀树
+     */
+    @PostConstruct // 初始化方法
+    public void init() {
+        sensitiveWordsUtils= this;
+        sensitiveWordsUtils.funSensitiveWordsTypeMapper = this.funSensitiveWordsTypeMapper;
+        sensitiveWordsUtils.funSensitiveWordsValueMapper = this.funSensitiveWordsValueMapper;
+        sensitiveWordsUtils.enableSensitiveWords = this.enableSensitiveWords;
+      refreshKeys();
+    }
+
+
+    public static void refreshKeys(){
+        roots.clear();
+        if (sensitiveWordsUtils.enableSensitiveWords) {
+            List<FunSensitiveWordsType> funSensitiveWordsTypes = sensitiveWordsUtils.funSensitiveWordsTypeMapper.getAll();
+            if (CollectionUtils.isEmpty(funSensitiveWordsTypes)) {
+                log.info("加载敏感词文件初始化完成");
+                return;
+            }
+            //改造从数据库中读取配置
+            for (FunSensitiveWordsType funSensitiveWordsType : funSensitiveWordsTypes) {
+                TrieNode trieNode = new TrieNode();
+                List<FunSensitiveWordsValue> byType = sensitiveWordsUtils.funSensitiveWordsValueMapper.getByType(funSensitiveWordsType.getSwType());
+                if (CollectionUtils.isNotEmpty(byType)) {
+                    for (FunSensitiveWordsValue keyword : byType) {
+                        // 添加到前缀树
+                        addKeyword(keyword.getSwValue(), trieNode);
+                    }
+                }
+                roots.put(funSensitiveWordsType.getSwType().toString(), trieNode);
+            }
+
+
+
+            log.info("加载敏感词文件初始化完成");
+        }
+    }
+
+    /**
+     * 将一个敏感词添加进前缀树中
+     *
+     * @param keyword
+     */
+    private static void addKeyword(String keyword, TrieNode rootNode) {
+        TrieNode tempNode = rootNode;
+        for (int i = 0; i < keyword.length(); i++) {
+            char c = keyword.charAt(i);
+            TrieNode subNode = tempNode.getSubNode(c);// 首先判断是否存在相同子节点
+
+            if (subNode == null) {
+                subNode = new TrieNode(); // 初始化子节点
+                tempNode.addSubNode(c, subNode); // 添加子节点
+            }
+
+            // 指向子节点，进入下一层循环
+            tempNode = subNode;
+
+            // 设置结束标识（叶子节点），表示这个字符是该敏感词的最后一个字符
+            if (i == keyword.length() - 1) {
+                tempNode.setKeywordEnd(true);
+            }
+        }
+    }
+
+
+    /**
+     * 查出敏感词
+     *
+     * @param text 待过滤的文本
+     * @return 过滤后的文本（即用 *** 替代敏感词）
+     */
+    public static String getSensitiveWords(String text, String type) {
+        if (StringUtils.isBlank(text)) {
+            return null;
+        }
+
+        // 指针 1：前缀树的工作指针
+        TrieNode tempNode = null;
+        TrieNode workNode = null;
+        TrieNode trieNode = roots.get(type);
+        if (Objects.nonNull(trieNode)) {
+            tempNode = trieNode;
+            workNode = trieNode;
+        } else {
+            log.error("Excuse me>>");
+            return null;
+        }
+        // 指针 2：指向文本中某个敏感词的第一位
+        int begin = 0;
+        // 指针 3；指向文本中某个敏感词的最后一位
+        int end = 0;
+
+        // 记录过滤后的文本（结果）
+        StringBuilder sb = new StringBuilder();
+        TreeSet<String> set = new TreeSet<>();
+
+        while (end < text.length()) {
+            char c = text.charAt(end);
+            // 跳过符号（防止敏感词混合符号，比如 ☆赌☆博）
+            if (isSymbol(c)) {
+                // 若指针 1 处于根节点，则将此符号计入结果（直接忽略），让指针 2 向下走一步
+                if (tempNode == workNode) {
+                    begin++;
+                }
+                // 无论符号在开头还是在中间，指针 3 都会向下走一步
+                end++;
+                continue;
+            }
+
+            // 检查子节点
+            TrieNode tempA = tempNode.getSubNode(c);
+            if (tempA == null) {
+                //通配符X
+                TrieNode tempX = tempNode.getSubNode('X') ;
+                if(tempX ==null){
+                    // 进入下一位的判断
+                    begin++;
+                    end = begin;
+                    // 指针 1 重新指向根节点
+                    tempNode = workNode;
+                }else{
+                    tempNode = tempX;
+                    // 检查下一个字符
+                    end++;
+                }
+
+            } else if (tempA.isKeywordEnd()) {
+                // 发现敏感词，将 begin~end 的字符串替换掉
+                //sb.append(REPLACEMENT);
+                for (int i = begin; i <= end; i++) {
+                    sb.append(text.charAt(i));
+                }
+
+                set.add(sb.toString());
+                sb = new StringBuilder();
+                // 进入下一位的判断
+                end++;
+                begin = end;
+                // 指针 1 重新指向根节点
+                tempNode = workNode;
+            } else {
+                tempNode =tempA;
+                // 检查下一个字符
+                end++;
+            }
+        }
+
+        if (CollectionUtils.isNotEmpty(set)) {
+            StringBuilder finalSb = sb;
+            set.stream().forEach(s -> {
+                finalSb.append(s).append(",");
+            });
+            return finalSb.substring(0, finalSb.length() - 1);
+        }
+        return null;
+    }
+
+    /**
+     * 过滤敏感词
+     *
+     * @param text 待过滤的文本
+     * @return 过滤后的文本（即用 *** 替代敏感词）
+     */
+    public static String filter(String text,String type) {
+        if (StringUtils.isBlank(text)) {
+            return null;
+        }
+
+        // 指针 1：前缀树的工作指针
+        TrieNode tempNode = null;
+        TrieNode workNode = null;
+        TrieNode trieNode = roots.get(type);
+        if (Objects.nonNull(trieNode)) {
+            tempNode = trieNode;
+            workNode = trieNode;
+        } else {
+            log.error("Excuse me>>");
+            return text;
+        }
+        // 指针 2：指向文本中某个敏感词的第一位
+        int begin = 0;
+        // 指针 3；指向文本中某个敏感词的最后一位
+        int end = 0;
+
+        // 记录过滤后的文本（结果）
+        StringBuilder sb = new StringBuilder();
+
+        while (end < text.length()) {
+            char c = text.charAt(end);
+            // 跳过符号（防止敏感词混合符号，比如 ☆赌☆博）
+            if (isSymbol(c)) {
+                // 若指针 1 处于根节点，则将此符号计入结果（直接忽略），让指针 2 向下走一步
+                if (tempNode == workNode) {
+                    sb.append(c);
+                    begin++;
+                }
+                // 无论符号在开头还是在中间，指针 3 都会向下走一步
+                end++;
+                continue;
+            }
+
+            // 检查子节点
+            TrieNode tempA = tempNode.getSubNode(c);
+            if (tempA == null) {
+                //通配符X
+                TrieNode tempX = tempNode.getSubNode('X') ;
+                if(tempX ==null){
+                    // 进入下一位的判断
+                    begin++;
+                    end = begin;
+                    // 指针 1 重新指向根节点
+                    tempNode = workNode;
+                }else{
+                    tempNode = tempX;
+                    // 检查下一个字符
+                    end++;
+                }
+
+            } else if (tempA.isKeywordEnd()) {
+                // 发现敏感词，将 begin~end 的字符串替换掉
+                sb.append(REPLACEMENT);
+                // 进入下一位的判断
+                end++;
+                begin = end;
+                // 指针 1 重新指向根节点
+                tempNode = workNode;
+            } else {
+                tempNode =tempA;
+                // 检查下一个字符
+                end++;
+            }
+        }
+
+        // 将最后一批字符计入结果（如果最后一次循环的字符串不是敏感词，上述的循环逻辑不会将其加入最终结果）
+        sb.append(text.substring(begin));
+
+        return sb.toString();
+    }
+
+    // 判断某个字符是否是符号
+    private static boolean isSymbol(Character c) {
+        // 0x2E80~0x9FFF 是东亚文字范围
+        return !CharUtils.isAsciiAlphanumeric(c) && (c < 0x2E80 || c > 0x9FFF);
+    }
+
+    /**
+     * 定义前缀树
+     */
+    private static class TrieNode {
+        // 关键词结束标识（叶子节点）
+        private boolean isKeywordEnd = false;
+        // 子节点(key:子节点字符, value:子节点类型)
+        private Map<Character, TrieNode> subNodes = new HashMap<>();
+
+        public boolean isKeywordEnd() {
+            return isKeywordEnd;
+        }
+
+        public void setKeywordEnd(boolean keywordEnd) {
+            isKeywordEnd = keywordEnd;
+        }
+
+        // 添加子节点
+        public void addSubNode(Character c, TrieNode node) {
+            subNodes.put(c, node);
+        }
+
+        // 获取子节点
+        public TrieNode getSubNode(Character c) {
+            return subNodes.get(c);
+        }
+    }
+
+
+}
